@@ -680,6 +680,13 @@ public:
     return false;
   }
 
+  virtual bool shouldMaximizeVectorBandwidthForPartialReduction(
+      Type *InputType, Type *AccumType,
+      TTI::PartialReductionExtendKind OpExtend, std::optional<unsigned> BinOp,
+      TargetTransformInfo::RegisterKind K) const {
+    return false;
+  }
+
   virtual ElementCount getMinimumVF(unsigned ElemWidth, bool IsScalable) const {
     return ElementCount::get(0, IsScalable);
   }

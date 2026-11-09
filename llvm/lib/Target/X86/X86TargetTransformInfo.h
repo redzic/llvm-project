@@ -63,6 +63,10 @@ public:
   bool hasConditionalLoadStoreForType(Type *Ty, bool IsStore) const override;
   TypeSize
   getRegisterBitWidth(TargetTransformInfo::RegisterKind K) const override;
+  bool shouldMaximizeVectorBandwidthForPartialReduction(
+      Type *InputType, Type *AccumType,
+      TTI::PartialReductionExtendKind OpExtend, std::optional<unsigned> BinOp,
+      TargetTransformInfo::RegisterKind K) const override;
   unsigned getLoadStoreVecRegBitWidth(unsigned AS) const override;
   unsigned getMaxInterleaveFactor(ElementCount VF,
                                   bool HasUnorderedReductions) const override;

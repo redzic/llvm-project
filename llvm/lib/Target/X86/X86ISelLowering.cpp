@@ -2861,6 +2861,7 @@ X86TargetLowering::X86TargetLowering(const X86TargetMachine &TM,
                        ISD::VECREDUCE_OR,
                        ISD::VECREDUCE_XOR,
                        ISD::VECREDUCE_MUL,
+                       ISD::PARTIAL_REDUCE_UMLA,
                        ISD::SINT_TO_FP,
                        ISD::UINT_TO_FP,
                        ISD::FP_TO_SINT,
@@ -47727,6 +47728,64 @@ static SDValue createPSADBW(SelectionDAG &DAG, SDValue N0, SDValue N1,
                           PSADBWBuilder);
 }
 
+// Byte sums and sums of absolute byte differences map onto PSADBW, which adds
+// up each group of 8 bytes into an i64 lane:
+//   partial_reduce_umla(acc, zext(x), splat(1))
+//     -> add(acc, psadbw(x, 0))
+//   partial_reduce_umla(acc, zext(abdu(a, b)), splat(1))
+//     -> add(acc, psadbw(a, b))
+// Each sum is at most 8 * 255, so an i32 accumulator can add the i64 lanes as
+// pairs of i32 lanes whose upper halves are zero. The zext may already have
+// been folded into the partial reduction when a dot product handles vXi8.
+//
+// This is done as a combine rather than by making these partial reductions
+// custom, as that would also let the generic combines fold i8 multiplies into
+// partial reductions that we would then have to expand. It has to run before
+// operation legalization expands the vXi8 ABDU.
+static SDValue combinePARTIAL_REDUCE_UMLA(SDNode *N, SelectionDAG &DAG,
+                                          TargetLowering::DAGCombinerInfo &DCI,
+                                          const X86Subtarget &Subtarget) {
+  using namespace SDPatternMatch;
+  if (!Subtarget.hasSSE2() || !DCI.isBeforeLegalizeOps() ||
+      !isOneOrOneSplat(N->getOperand(2)))
+    return SDValue();
+
+  SDValue Acc = N->getOperand(0);
+  SDValue In = N->getOperand(1);
+  if (In.getOpcode() == ISD::ZERO_EXTEND)
+    In = In.getOperand(0);
+
+  // The PSADBW is as wide as the accumulator, and split into legal widths.
+  EVT AccVT = Acc.getValueType();
+  EVT InVT = In.getValueType();
+  if (InVT.getScalarType() != MVT::i8 ||
+      (AccVT.getScalarType() != MVT::i32 &&
+       AccVT.getScalarType() != MVT::i64) ||
+      AccVT.getSizeInBits() != InVT.getSizeInBits() ||
+      AccVT.getSizeInBits() < 128 || !isPowerOf2_32(AccVT.getSizeInBits()))
+    return SDValue();
+
+  SDValue A, B;
+  if (!sd_match(In, m_AnyOf(m_c_BinOp(ISD::ABDU, m_Value(A), m_Value(B)),
+                            m_Sub(m_UMax(m_Value(A), m_Value(B)),
+                                  m_UMin(m_Deferred(A), m_Deferred(B)))))) {
+    A = In;
+    B = DAG.getConstant(0, SDLoc(N), InVT);
+  }
+
+  SDLoc DL(N);
+  auto PSADBWBuilder = [](SelectionDAG &DAG, const SDLoc &DL,
+                          ArrayRef<SDValue> Ops) {
+    MVT VT = MVT::getVectorVT(MVT::i64, Ops[0].getValueSizeInBits() / 64);
+    return DAG.getNode(X86ISD::PSADBW, DL, VT, Ops);
+  };
+  EVT SadVT =
+      EVT::getVectorVT(*DAG.getContext(), MVT::i64, AccVT.getSizeInBits() / 64);
+  SDValue SAD =
+      SplitOpsAndApply(DAG, Subtarget, DL, SadVT, {A, B}, PSADBWBuilder);
+  return DAG.getNode(ISD::ADD, DL, AccVT, Acc, DAG.getBitcast(AccVT, SAD));
+}
+
 // Attempt to replace an all_of/any_of/parity style horizontal reduction with a MOVMSK.
 static SDValue combineVECREDUCE_LOGIC(SDNode *Reduce, SelectionDAG &DAG,
                                       const X86Subtarget &Subtarget) {
@@ -64362,6 +64421,8 @@ SDValue X86TargetLowering::PerformDAGCombine(SDNode *N,
   case ISD::VECREDUCE_OR:
   case ISD::VECREDUCE_XOR:  return combineVECREDUCE_LOGIC(N, DAG, Subtarget);
   case ISD::VECREDUCE_MUL:  return combineVECREDUCE_MUL(N, DAG, Subtarget);
+  case ISD::PARTIAL_REDUCE_UMLA:
+    return combinePARTIAL_REDUCE_UMLA(N, DAG, DCI, Subtarget);
   case ISD::TRUNCATE:       return combineTruncate(N, DAG, Subtarget);
   case X86ISD::VTRUNC:      return combineVTRUNC(N, DAG, DCI);
   case X86ISD::VTRUNCS:

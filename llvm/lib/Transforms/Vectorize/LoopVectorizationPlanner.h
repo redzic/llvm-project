@@ -668,6 +668,12 @@ class VFSelectionContext {
   /// user options, for the given register kind (scalable or fixed-width).
   bool useMaxBandwidth(bool IsScalable) const;
 
+  /// \return True if the loop has an add reduction of values extended from a
+  /// narrower type, which the target wants maximized bandwidth for, as it can
+  /// turn it into a cheap partial reduction.
+  bool hasProfitablePartialReductionForMaxBandwidth(
+      TargetTransformInfo::RegisterKind RegKind) const;
+
   /// \return the maximized element count based on the targets vector
   /// registers and the loop trip-count, but limited to a maximum safe VF.
   /// This is a helper function of computeFeasibleMaxVF.

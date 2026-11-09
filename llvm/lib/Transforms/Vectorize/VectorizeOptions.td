@@ -59,6 +59,8 @@ defm : OptionalBoolField<"vectorizer-maximize-bandwidth",
   "Maximize bandwidth when selecting vectorization factor which will be determined by the smallest type in loop">;
 defm : BoolField<"vectorizer-maximize-bandwidth-for-vector-calls", "true",
   "Try wider VFs if they enable the use of vector variants">;
+defm : BoolField<"vectorizer-maximize-bandwidth-for-partial-reductions", "true",
+  "Try wider VFs for loops with add reductions of extended values if the target can reduce them cheaply">;
 
 // LoopVectorize.cpp
 defm : BoolField<"enable-early-exit-vectorization", "true",

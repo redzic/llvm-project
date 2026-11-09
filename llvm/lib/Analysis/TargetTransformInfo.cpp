@@ -895,6 +895,13 @@ bool TargetTransformInfo::shouldMaximizeVectorBandwidth(
   return TTIImpl->shouldMaximizeVectorBandwidth(K);
 }
 
+bool TargetTransformInfo::shouldMaximizeVectorBandwidthForPartialReduction(
+    Type *InputType, Type *AccumType, PartialReductionExtendKind OpExtend,
+    std::optional<unsigned> BinOp, RegisterKind K) const {
+  return TTIImpl->shouldMaximizeVectorBandwidthForPartialReduction(
+      InputType, AccumType, OpExtend, BinOp, K);
+}
+
 ElementCount TargetTransformInfo::getMinimumVF(unsigned ElemWidth,
                                                bool IsScalable) const {
   return TTIImpl->getMinimumVF(ElemWidth, IsScalable);

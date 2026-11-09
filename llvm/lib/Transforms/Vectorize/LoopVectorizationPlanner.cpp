@@ -19,6 +19,7 @@
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Vectorize/LoopVectorizationLegality.h"
@@ -119,14 +120,94 @@ bool VFSelectionContext::supportsScalableVectors() const {
          VectorizerParams::VectorizationFactor.isScalable();
 }
 
+namespace {
+/// The shape of a reduction input that the vectorizer can turn into a partial
+/// reduction, in the terms of TTI::getPartialReductionCost.
+struct ExtendedReductionInput {
+  Type *InputType;
+  TTI::PartialReductionExtendKind OpExtend;
+  std::optional<unsigned> BinOp;
+};
+} // namespace
+
+/// Match \p V, an input to an add reduction of \p RdxBits-wide values, against
+/// the shapes the vectorizer turns into partial reductions: an extend from a
+/// narrower type, the absolute difference of two such extends, or their
+/// product.
+static std::optional<ExtendedReductionInput>
+matchExtendedReductionInput(Value *V, unsigned RdxBits) {
+  using namespace PatternMatch;
+  auto MatchExt =
+      [RdxBits](Value *Op) -> std::optional<ExtendedReductionInput> {
+    auto *Ext = dyn_cast<CastInst>(Op);
+    if (!Ext || !isa<ZExtInst, SExtInst>(Ext) ||
+        Ext->getSrcTy()->getScalarSizeInBits() >= RdxBits)
+      return std::nullopt;
+    return ExtendedReductionInput{
+        Ext->getSrcTy(), TTI::getPartialReductionExtendKind(Ext), std::nullopt};
+  };
+
+  Value *A, *B;
+  // ext(mul(ext(a), ext(b))) is a product of the inner extends.
+  if (match(V, m_ZExtOrSExt(m_Mul(m_Value(A), m_Value(B)))) &&
+      isa<ZExtInst, SExtInst>(A))
+    V = cast<Instruction>(V)->getOperand(0);
+  if (auto Ext = MatchExt(V))
+    return Ext;
+  // abs(sub(ext(a), ext(b))) becomes ext(absolute-difference(a, b)), which is
+  // zero extended whatever the extends of a and b were.
+  if (match(V, m_Intrinsic<Intrinsic::abs>(m_Sub(m_Value(A), m_Value(B))))) {
+    auto ExtA = MatchExt(A), ExtB = MatchExt(B);
+    if (!ExtA || !ExtB || ExtA->InputType != ExtB->InputType)
+      return std::nullopt;
+    return ExtendedReductionInput{ExtA->InputType, TTI::PR_ZeroExtend,
+                                  std::nullopt};
+  }
+  if (match(V, m_Mul(m_Value(A), m_Value(B)))) {
+    auto ExtA = MatchExt(A);
+    if (!ExtA || (!isa<Constant>(B) && !MatchExt(B)))
+      return std::nullopt;
+    return ExtendedReductionInput{ExtA->InputType, ExtA->OpExtend,
+                                  Instruction::Mul};
+  }
+  return std::nullopt;
+}
+
+bool VFSelectionContext::hasProfitablePartialReductionForMaxBandwidth(
+    TargetTransformInfo::RegisterKind RegKind) const {
+  for (const auto &[Phi, RdxDesc] : Legal->getReductionVars()) {
+    if (RdxDesc.getRecurrenceKind() != RecurKind::Add)
+      continue;
+    Type *RdxTy = RdxDesc.getRecurrenceType();
+    SmallVector<Instruction *, 4> Chain =
+        RdxDesc.getReductionOpChain(Phi, const_cast<Loop *>(TheLoop));
+    if (Chain.empty() && RdxDesc.getLoopExitInstr())
+      Chain.push_back(RdxDesc.getLoopExitInstr());
+    for (Instruction *I : Chain) {
+      for (Value *Op : I->operands()) {
+        if (Op == Phi || is_contained(Chain, Op))
+          continue;
+        auto In = matchExtendedReductionInput(Op, RdxTy->getScalarSizeInBits());
+        if (In && TTI.shouldMaximizeVectorBandwidthForPartialReduction(
+                      In->InputType, RdxTy, In->OpExtend, In->BinOp, RegKind))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool VFSelectionContext::useMaxBandwidth(bool IsScalable) const {
   TargetTransformInfo::RegisterKind RegKind =
       IsScalable ? TargetTransformInfo::RGK_ScalableVector
                  : TargetTransformInfo::RGK_FixedWidthVector;
-  return valueOr(Opts.vectorizer_maximize_bandwidth,
-                 TTI.shouldMaximizeVectorBandwidth(RegKind) ||
-                     (Opts.vectorizer_maximize_bandwidth_for_vector_calls &&
-                      Legal->hasVectorCallVariants()));
+  return valueOr(
+      Opts.vectorizer_maximize_bandwidth,
+      TTI.shouldMaximizeVectorBandwidth(RegKind) ||
+          (Opts.vectorizer_maximize_bandwidth_for_vector_calls &&
+           Legal->hasVectorCallVariants()) ||
+          (Opts.vectorizer_maximize_bandwidth_for_partial_reductions &&
+           hasProfitablePartialReductionForMaxBandwidth(RegKind)));
 }
 
 bool VFSelectionContext::shouldConsiderRegPressureForVF(ElementCount VF) const {

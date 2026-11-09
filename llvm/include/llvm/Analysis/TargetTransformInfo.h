@@ -1471,6 +1471,18 @@ public:
   LLVM_ABI bool
   shouldMaximizeVectorBandwidth(TargetTransformInfo::RegisterKind K) const;
 
+  /// \return True if the vectorization factor should be chosen as with
+  /// shouldMaximizeVectorBandwidth for a loop containing an add reduction into
+  /// \p AccumType of \p InputType values, extended with \p OpExtend and
+  /// optionally combined with \p BinOp first (see getPartialReductionCost).
+  /// This lets a target that cheaply reduces narrow elements into a wider
+  /// accumulator consider those VFs without maximizing the bandwidth of every
+  /// loop.
+  /// \p K Register Kind for vectorization.
+  LLVM_ABI bool shouldMaximizeVectorBandwidthForPartialReduction(
+      Type *InputType, Type *AccumType, PartialReductionExtendKind OpExtend,
+      std::optional<unsigned> BinOp, RegisterKind K) const;
+
   /// \return The minimum vectorization factor for types of given element
   /// bit width, or 0 if there is no minimum VF. The returned value only
   /// applies when shouldMaximizeVectorBandwidth returns true.

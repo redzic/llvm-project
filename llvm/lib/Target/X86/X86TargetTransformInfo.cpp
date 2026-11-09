@@ -198,6 +198,19 @@ X86TTIImpl::getRegisterBitWidth(TargetTransformInfo::RegisterKind K) const {
   llvm_unreachable("Unsupported register kind");
 }
 
+// PSADBW reduces a full vector of bytes, or of absolute byte differences, into
+// an i32 or i64 accumulator of the same width (see getPartialReductionCost), so
+// these loops want a VF sized by the bytes rather than the accumulator.
+// TODO: VNNI dot products would benefit in the same way.
+bool X86TTIImpl::shouldMaximizeVectorBandwidthForPartialReduction(
+    Type *InputType, Type *AccumType, TTI::PartialReductionExtendKind OpExtend,
+    std::optional<unsigned> BinOp, TargetTransformInfo::RegisterKind K) const {
+  return K == TargetTransformInfo::RGK_FixedWidthVector && ST->hasSSE2() &&
+         !BinOp && OpExtend == TTI::PR_ZeroExtend &&
+         InputType->isIntegerTy(8) &&
+         (AccumType->isIntegerTy(32) || AccumType->isIntegerTy(64));
+}
+
 unsigned X86TTIImpl::getLoadStoreVecRegBitWidth(unsigned) const {
   return getRegisterBitWidth(TargetTransformInfo::RGK_FixedWidthVector)
       .getFixedValue();
@@ -6275,6 +6288,34 @@ InstructionCost X86TTIImpl::getPartialReductionCost(
                                           AccumType, VF, OpAExtend, OpBExtend,
                                           BinOp, CostKind, FMF);
   };
+
+  // A zero extended byte sum accumulated into i32 or i64 is a PSADBW against
+  // zero plus an add. The vectorizer also expresses a sum of absolute byte
+  // differences this way (as the zero extended absolute difference), which
+  // becomes a single PSADBW of both inputs.
+  if (Opcode == Instruction::Add && !BinOp && !VF.isScalable() &&
+      OpAExtend == TTI::PR_ZeroExtend && InputTypeA->isIntegerTy(8) &&
+      (AccumType->isIntegerTy(32) || AccumType->isIntegerTy(64))) {
+    unsigned Ratio = AccumType->getScalarSizeInBits() / 8;
+    if (!VF.isKnownMultipleOf(Ratio))
+      return ExpandCost();
+    auto *AccVecTy = VectorType::get(AccumType, VF.divideCoefficientBy(Ratio));
+    auto *InputVecTy = VectorType::get(InputTypeA, VF);
+    std::pair<InstructionCost, MVT> AccLT = getTypeLegalizationCost(AccVecTy);
+    std::pair<InstructionCost, MVT> InputLT =
+        getTypeLegalizationCost(InputVecTy);
+    // X86 combines these into PSADBW when the accumulator is as wide as the
+    // input; narrower accumulators are widened and expanded instead.
+    unsigned InputBits = InputLT.second.getFixedSizeInBits();
+    if (!ST->hasSSE2() ||
+        AccLT.second.getFixedSizeInBits() >
+            AccVecTy->getPrimitiveSizeInBits().getFixedValue() ||
+        AccLT.second.getFixedSizeInBits() != InputBits || InputBits < 128 ||
+        (InputBits == 256 && !ST->hasAVX2()))
+      return ExpandCost();
+    // One PSADBW and one add per legal input vector.
+    return 2 * InputLT.first;
+  }
 
   // The dot product instructions multiply-accumulate i8 x i8 -> i32,
   // i16 x i16 -> i32, bf16 x bf16 -> f32 or f16 x f16 -> f32. Partial
